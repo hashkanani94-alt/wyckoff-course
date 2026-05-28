@@ -1,625 +1,328 @@
 """
-analysis/wyckoff_detector.py
-=============================
-Detects Wyckoff events based ONLY on rules from the original SMI course.
-Rules source: WYCKOFF_BEHAVIOR_RULES.txt + WYCKOFF_COMPLETE_COURSE_FULLTEXT.txt
+analysis/wyckoff_detector.py — Full Wyckoff SMI Course Detector
 """
-
 import pandas as pd
 import numpy as np
 
 
-# ─────────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────────
-
-def avg_vol(df, window=20):
-    return df["Volume"].rolling(window).mean()
-
-def avg_spread(df, window=20):
-    return (df["High"] - df["Low"]).rolling(window).mean()
-
+def avg_vol(df, w=20):  return df["Volume"].rolling(w).mean()
+def avg_spd(df, w=20):  return (df["High"] - df["Low"]).rolling(w).mean()
 def close_pos(row):
-    rng = row["High"] - row["Low"]
-    if rng == 0: return 0.5
-    return (row["Close"] - row["Low"]) / rng
+    r = row["High"] - row["Low"]
+    return (row["Close"] - row["Low"]) / r if r else 0.5
+def vol_rank(df, i, lb=50):
+    s = max(0, i-lb)
+    return (df["Volume"].iloc[s:i+1] <= df["Volume"].iloc[i]).mean()
 
-def vol_rank(df, i, lookback=30):
-    start = max(0, i - lookback)
-    return (df["Volume"].iloc[start:i+1] <= df["Volume"].iloc[i]).mean()
+def find_swings(df, w=10):
+    hi, lo = df["High"].values, df["Low"].values
+    peaks, troughs = [], []
+    for i in range(w, len(df)-w):
+        if hi[i] == max(hi[i-w:i+w+1]): peaks.append(i)
+        if lo[i] == min(lo[i-w:i+w+1]): troughs.append(i)
+    return peaks, troughs
 
-
-# ─────────────────────────────────────────────────────────────────
-#  SWING POINTS — find local highs & lows
-# ─────────────────────────────────────────────────────────────────
-
-def find_swings(df, window=10):
-    """Find all swing highs and lows."""
-    highs, lows = [], []
-    prices = df["Close"].values
-    hi = df["High"].values
-    lo = df["Low"].values
-
-    for i in range(window, len(df) - window):
-        if hi[i] == max(hi[i-window:i+window+1]):
-            highs.append(i)
-        if lo[i] == min(lo[i-window:i+window+1]):
-            lows.append(i)
-    return highs, lows
-
-
-# ─────────────────────────────────────────────────────────────────
-#  SELLING CLIMAX (SC)
-#  Rules from course:
-#  - After prolonged downtrend
-#  - Climactic volume (highest or near highest)
-#  - Wide spread bar
-#  - Close in upper half of bar
-#  - Price bounces after
-# ─────────────────────────────────────────────────────────────────
-
+# ── SC ────────────────────────────────────────────────────────────
 def find_SC(df):
-    _, lows = find_swings(df, window=10)
-    avv = avg_vol(df, 20)
-    avs = avg_spread(df, 20)
-    candidates = []
-
-    for i in lows:
-        if i < 20 or i > len(df) - 5:
-            continue
+    _, troughs = find_swings(df, 10)
+    avs = avg_spd(df, 20)
+    best = None
+    for i in troughs:
+        if i < 20 or i > len(df)-5: continue
         row = df.iloc[i]
+        if df["Close"].iloc[max(0,i-15)] <= row["Close"]*1.04: continue
+        if vol_rank(df, i, 60) < 0.72: continue
+        spread = row["High"]-row["Low"]
+        if avs.iloc[i] > 0 and spread < avs.iloc[i]*0.9: continue
+        if close_pos(row) < 0.40: continue
+        nxt = df["Close"].iloc[i+1:i+6]
+        if (nxt > row["Close"]).sum() < 2: continue
+        if best is None or row["Volume"] > best["volume"]:
+            best = {"event":"SC","date":str(df.index[i].date()),
+                    "price":round(float(row["Low"]),2),
+                    "volume":int(row["Volume"]),"bar_index":i}
+    return best
 
-        # Must be preceded by downtrend (price 15 bars ago > current)
-        prev_close = df["Close"].iloc[max(0, i-15)]
-        if prev_close <= row["Close"] * 1.05:
-            continue
-
-        # Climactic volume
-        vr = vol_rank(df, i, lookback=50)
-        if vr < 0.75:
-            continue
-
-        # Wide spread
-        spread = row["High"] - row["Low"]
-        if avs.iloc[i] > 0 and spread < avs.iloc[i] * 1.0:
-            continue
-
-        # Close in upper half
-        if close_pos(row) < 0.45:
-            continue
-
-        # Price bounces after (at least 2 of next 5 bars close higher)
-        next5 = df["Close"].iloc[i+1:i+6]
-        if (next5 > row["Close"]).sum() < 2:
-            continue
-
-        candidates.append({
-            "event": "SC",
-            "date": str(df.index[i].date()),
-            "price": round(float(row["Low"]), 2),
-            "volume": int(row["Volume"]),
-            "bar_index": i
-        })
-
-    if not candidates:
-        return None
-    # Return the one with highest volume rank
-    return max(candidates, key=lambda x: x["volume"])
-
-
-# ─────────────────────────────────────────────────────────────────
-#  AUTOMATIC RALLY (AR)
-#  Rules: First sharp rally after SC, lower volume than SC,
-#         establishes top of trading range
-# ─────────────────────────────────────────────────────────────────
-
+# ── AR ────────────────────────────────────────────────────────────
 def find_AR(df, sc):
-    if not sc:
-        return None
-    sc_i = sc["bar_index"]
-    sc_vol = sc["volume"]
+    if not sc: return None
+    si, sv = sc["bar_index"], sc["volume"]
+    seg = df.iloc[si+1:si+25]
+    if seg.empty: return None
+    loc = seg["High"].idxmax(); ai = df.index.get_loc(loc)
+    row = df.iloc[ai]
+    if row["Volume"] > sv*1.3: return None
+    if row["High"] < df.iloc[si]["Low"]*1.03: return None
+    return {"event":"AR","date":str(df.index[ai].date()),
+            "price":round(float(row["High"]),2),
+            "volume":int(row["Volume"]),"bar_index":ai}
 
-    # Look for highest high in next 20 bars
-    search = df.iloc[sc_i+1: sc_i+25]
-    if search.empty:
-        return None
-
-    ar_loc = search["High"].idxmax()
-    ar_i = df.index.get_loc(ar_loc)
-    row = df.iloc[ar_i]
-
-    # Volume should be less than SC
-    if row["Volume"] > sc_vol * 1.2:
-        return None
-
-    # Must rally at least 3%
-    if row["High"] < df.iloc[sc_i]["Low"] * 1.03:
-        return None
-
-    return {
-        "event": "AR",
-        "date": str(df.index[ar_i].date()),
-        "price": round(float(row["High"]), 2),
-        "volume": int(row["Volume"]),
-        "bar_index": ar_i
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-#  SECONDARY TEST (ST)
-#  Rules: Returns to SC area, LOWER volume than SC, holds above SC
-# ─────────────────────────────────────────────────────────────────
-
+# ── STs ───────────────────────────────────────────────────────────
 def find_STs(df, sc, ar):
-    if not sc or not ar:
-        return []
-    sc_i = sc["bar_index"]
-    ar_i = ar["bar_index"]
-    sc_low = sc["price"]
-    sc_vol = sc["volume"]
+    if not sc or not ar: return []
+    ai, sl, sv = ar["bar_index"], sc["price"], sc["volume"]
     sts = []
-
-    search = df.iloc[ar_i+1: ar_i+60]
-    for date, row in search.iterrows():
+    for date, row in df.iloc[ai+1:ai+80].iterrows():
         i = df.index.get_loc(date)
-        # Near SC low (within 5%)
-        if abs(row["Low"] - sc_low) / sc_low < 0.05:
-            if row["Volume"] < sc_vol * 0.85:
-                if row["Low"] >= sc_low * 0.97:
-                    sts.append({
-                        "event": "ST",
-                        "date": str(date.date()),
-                        "price": round(float(row["Low"]), 2),
-                        "volume": int(row["Volume"]),
-                        "bar_index": i
-                    })
-                    if len(sts) >= 3:
-                        break
+        if abs(row["Low"]-sl)/sl < 0.06 and row["Volume"] < sv*0.88 and row["Low"] >= sl*0.96:
+            sts.append({"event":"ST","date":str(date.date()),
+                        "price":round(float(row["Low"]),2),
+                        "volume":int(row["Volume"]),"bar_index":i})
+            if len(sts) >= 3: break
     return sts
 
-
-# ─────────────────────────────────────────────────────────────────
-#  SPRING
-#  Rules: Breaks below SC low briefly, low volume, closes back above
-# ─────────────────────────────────────────────────────────────────
-
+# ── Spring ────────────────────────────────────────────────────────
 def find_Spring(df, sc, ar):
-    if not sc or not ar:
-        return None
-    ar_i = ar["bar_index"]
-    sc_low = sc["price"]
-    sc_vol = sc["volume"]
-
-    search = df.iloc[ar_i+1: ar_i+80]
-    for date, row in search.iterrows():
+    if not sc or not ar: return None
+    ai, sl, sv = ar["bar_index"], sc["price"], sc["volume"]
+    for date, row in df.iloc[ai+1:ai+100].iterrows():
         i = df.index.get_loc(date)
-        if row["Low"] < sc_low:
-            if row["Volume"] < sc_vol:
-                if row["Close"] > sc_low:
-                    return {
-                        "event": "Spring",
-                        "date": str(date.date()),
-                        "price": round(float(row["Low"]), 2),
-                        "volume": int(row["Volume"]),
-                        "bar_index": i
-                    }
+        if row["Low"] < sl and row["Volume"] < sv and row["Close"] > sl:
+            return {"event":"Spring","date":str(date.date()),
+                    "price":round(float(row["Low"]),2),
+                    "volume":int(row["Volume"]),"bar_index":i}
     return None
 
-
-# ─────────────────────────────────────────────────────────────────
-#  SIGN OF STRENGTH (SOS)
-#  Rules: Strong advance on wide spread + high volume, breaks AR high
-# ─────────────────────────────────────────────────────────────────
-
+# ── SOS ───────────────────────────────────────────────────────────
 def find_SOS(df, sc, ar):
-    if not sc or not ar:
-        return None
-    ar_i = ar["bar_index"]
-    ar_high = ar["price"]
-    avv = avg_vol(df, 20)
-    avs = avg_spread(df, 20)
-
-    search = df.iloc[ar_i+1: ar_i+100]
-    for date, row in search.iterrows():
+    if not sc or not ar: return None
+    ai, ah = ar["bar_index"], ar["price"]
+    avv, avs = avg_vol(df,20), avg_spd(df,20)
+    for date, row in df.iloc[ai+1:ai+120].iterrows():
         i = df.index.get_loc(date)
-        if row["High"] > ar_high:
-            spread = row["High"] - row["Low"]
-            if avs.iloc[i] > 0 and spread > avs.iloc[i]:
-                if avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i] * 1.2:
-                    if close_pos(row) > 0.55:
-                        return {
-                            "event": "SOS",
-                            "date": str(date.date()),
-                            "price": round(float(row["High"]), 2),
-                            "volume": int(row["Volume"]),
-                            "bar_index": i
-                        }
+        sp = row["High"]-row["Low"]
+        if (row["High"] > ah and
+            avs.iloc[i] > 0 and sp > avs.iloc[i]*0.9 and
+            avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*1.1 and
+            close_pos(row) > 0.55):
+            return {"event":"SOS","date":str(date.date()),
+                    "price":round(float(row["High"]),2),
+                    "volume":int(row["Volume"]),"bar_index":i}
     return None
 
-
-# ─────────────────────────────────────────────────────────────────
-#  LPS — Last Point of Support
-#  Rules: Higher low after SOS, low volume pullback
-# ─────────────────────────────────────────────────────────────────
-
+# ── LPS ───────────────────────────────────────────────────────────
 def find_LPS(df, sc, sos):
-    if not sc or not sos:
-        return None
-    sos_i = sos["bar_index"]
+    if not sc or not sos: return None
+    _, troughs = find_swings(df, 5)
     avv = avg_vol(df, 20)
-    _, lows = find_swings(df, window=5)
-
-    for i in lows:
-        if i <= sos_i or i >= len(df) - 3:
-            continue
+    for i in troughs:
+        if i <= sos["bar_index"] or i >= len(df)-3: continue
         row = df.iloc[i]
-        # Must be higher than SC
-        if row["Low"] < sc["price"]:
-            continue
-        # Low volume
-        if avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i] * 0.9:
-            continue
-        return {
-            "event": "LPS",
-            "date": str(df.index[i].date()),
-            "price": round(float(row["Low"]), 2),
-            "volume": int(row["Volume"]),
-            "bar_index": i
-        }
+        if row["Low"] < sc["price"]: continue
+        if avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*0.95: continue
+        return {"event":"LPS","date":str(df.index[i].date()),
+                "price":round(float(row["Low"]),2),
+                "volume":int(row["Volume"]),"bar_index":i}
     return None
 
-
-# ─────────────────────────────────────────────────────────────────
-#  BUYING CLIMAX (BC) — Distribution
-#  Rules: After uptrend, climactic volume, wide spread, close near LOW
-# ─────────────────────────────────────────────────────────────────
-
+# ── BC ────────────────────────────────────────────────────────────
 def find_BC(df):
-    highs, _ = find_swings(df, window=10)
-    avv = avg_vol(df, 20)
-    avs = avg_spread(df, 20)
-    candidates = []
-
-    for i in highs:
-        if i < 20 or i > len(df) - 5:
-            continue
+    peaks, _ = find_swings(df, 10)
+    avs = avg_spd(df, 20)
+    best = None
+    for i in peaks:
+        if i < 20 or i > len(df)-5: continue
         row = df.iloc[i]
+        if df["Close"].iloc[max(0,i-15)] >= row["Close"]*0.96: continue
+        if vol_rank(df, i, 60) < 0.72: continue
+        sp = row["High"]-row["Low"]
+        if avs.iloc[i] > 0 and sp < avs.iloc[i]*0.9: continue
+        if close_pos(row) > 0.55: continue
+        if best is None or row["Volume"] > best["volume"]:
+            best = {"event":"BC","date":str(df.index[i].date()),
+                    "price":round(float(row["High"]),2),
+                    "volume":int(row["Volume"]),"bar_index":i}
+    return best
 
-        # Must be preceded by uptrend
-        prev_close = df["Close"].iloc[max(0, i-15)]
-        if prev_close >= row["Close"] * 0.95:
-            continue
-
-        # Climactic volume
-        vr = vol_rank(df, i, lookback=50)
-        if vr < 0.75:
-            continue
-
-        # Wide spread
-        spread = row["High"] - row["Low"]
-        if avs.iloc[i] > 0 and spread < avs.iloc[i] * 1.0:
-            continue
-
-        # Close in LOWER half of bar
-        if close_pos(row) > 0.55:
-            continue
-
-        candidates.append({
-            "event": "BC",
-            "date": str(df.index[i].date()),
-            "price": round(float(row["High"]), 2),
-            "volume": int(row["Volume"]),
-            "bar_index": i
-        })
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda x: x["volume"])
-
-
-# ─────────────────────────────────────────────────────────────────
-#  PSY — Preliminary Supply
-#  Rules: First selling after prolonged advance, volume increases
-# ─────────────────────────────────────────────────────────────────
-
+# ── PSY ───────────────────────────────────────────────────────────
 def find_PSY(df, bc):
-    if not bc:
-        return None
-    bc_i = bc["bar_index"]
+    if not bc: return None
+    peaks, _ = find_swings(df, 8)
+    before = [i for i in peaks if i < bc["bar_index"]-5]
+    if not before: return None
+    i = before[-1]; row = df.iloc[i]
     avv = avg_vol(df, 20)
-    highs, _ = find_swings(df, window=8)
+    if avv.iloc[i] > 0 and row["Volume"] < avv.iloc[i]*0.8: return None
+    return {"event":"PSY","date":str(df.index[i].date()),
+            "price":round(float(row["High"]),2),
+            "volume":int(row["Volume"]),"bar_index":i}
 
-    # Look for swing high before BC
-    before_bc = [i for i in highs if i < bc_i - 5]
-    if not before_bc:
-        return None
-
-    i = before_bc[-1]
-    row = df.iloc[i]
-
-    # Volume increasing
-    if avv.iloc[i] > 0 and row["Volume"] < avv.iloc[i]:
-        return None
-
-    return {
-        "event": "PSY",
-        "date": str(df.index[i].date()),
-        "price": round(float(row["High"]), 2),
-        "volume": int(row["Volume"]),
-        "bar_index": i
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-#  SOW — Sign of Weakness
-#  Rules: Strong decline on wide spread + high volume, breaks AR low
-# ─────────────────────────────────────────────────────────────────
-
-def find_SOW(df, bc, ar_dist):
-    if not bc or not ar_dist:
-        return None
-    ar_i = ar_dist["bar_index"]
-    ar_low = ar_dist["price"]
-    avv = avg_vol(df, 20)
-    avs = avg_spread(df, 20)
-
-    search = df.iloc[ar_i+1: ar_i+80]
-    for date, row in search.iterrows():
-        i = df.index.get_loc(date)
-        if row["Low"] < ar_low:
-            spread = row["High"] - row["Low"]
-            if avs.iloc[i] > 0 and spread > avs.iloc[i]:
-                if avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i] * 1.2:
-                    if close_pos(row) < 0.45:
-                        return {
-                            "event": "SOW",
-                            "date": str(date.date()),
-                            "price": round(float(row["Low"]), 2),
-                            "volume": int(row["Volume"]),
-                            "bar_index": i
-                        }
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────
-#  RE-ACCUMULATION — Stepping Stone TR during Markup
-# ─────────────────────────────────────────────────────────────────
-
+# ── Re-Accumulation zones ─────────────────────────────────────────
 def find_reaccumulation(df, sos):
-    if not sos:
-        return []
-    sos_i = sos["bar_index"]
-    results = []
-    avv = avg_vol(df, 20)
-    window = 20
-    step = 15
-
-    i = sos_i + 20
-    while i < len(df) - window:
-        chunk = df.iloc[i:i+window]
-        price_range = (chunk["High"].max() - chunk["Low"].min()) / chunk["Close"].mean()
-        avg_v = avv.iloc[i+window//2] if avv.iloc[i+window//2] > 0 else 1
-        avg_vol_chunk = chunk["Volume"].mean()
-
-        # Tight price range (< 8%) with decreasing volume = re-accumulation
-        if price_range < 0.08 and avg_vol_chunk < avg_v * 0.85:
-            mid_date = df.index[i + window//2]
-            mid_price = chunk["Close"].mean()
+    if not sos: return []
+    results, avv, w = [], avg_vol(df, 20), 25
+    i = sos["bar_index"] + 25
+    while i < len(df) - w:
+        chunk = df.iloc[i:i+w]
+        rng = (chunk["High"].max()-chunk["Low"].min())/chunk["Close"].mean()
+        av = avv.iloc[i+w//2] if avv.iloc[i+w//2] > 0 else 1
+        if rng < 0.07 and chunk["Volume"].mean() < av*0.85:
             results.append({
-                "event": "ReAcc",
-                "date": str(mid_date.date()),
-                "price": round(float(mid_price), 2),
-                "volume": int(avg_vol_chunk),
-                "bar_index": i + window//2
+                "event":"ReAcc",
+                "date":str(df.index[i+w//2].date()),
+                "price":round(float(chunk["Close"].mean()),2),
+                "volume":int(chunk["Volume"].mean()),
+                "bar_index":i+w//2,
+                "x0": str(df.index[i].date()),
+                "x1": str(df.index[min(i+w, len(df)-1)].date()),
+                "y0": round(float(chunk["Low"].min()*0.995),2),
+                "y1": round(float(chunk["High"].max()*1.005),2),
             })
-            i += window
+            i += w
+            if len(results) >= 3: break
         else:
-            i += step
+            i += 10
+    return results
 
-    return results[:3]  # max 3 re-accumulation zones
+# ── Phase labels for chart ────────────────────────────────────────
+def build_phase_labels(events, sc, ar, spring, sos, bc, df):
+    """Returns list of phase band annotations for the chart."""
+    labels = []
+    last = str(df.index[-1].date())
 
+    if sc and ar:
+        labels.append({"text":"Phase A","x0":sc["date"],"x1":ar["date"],"color":"#e53935"})
+    if ar and spring:
+        labels.append({"text":"Phase B","x0":ar["date"],"x1":spring["date"],"color":"#fb8c00"})
+    if spring and sos:
+        labels.append({"text":"Phase C","x0":spring["date"],"x1":sos["date"],"color":"#fdd835"})
+    if sos:
+        labels.append({"text":"Phase D→E (Markup)","x0":sos["date"],"x1":last,"color":"#43a047"})
+    return labels
 
-# ─────────────────────────────────────────────────────────────────
-#  WAVE ANALYSIS (Section 5M)
-# ─────────────────────────────────────────────────────────────────
+# ── Trend lines ───────────────────────────────────────────────────
+def build_trend_lines(events, sc, ar, spring, sos, lps):
+    tls = []
+    # Demand line: SC → Spring or SC → LPS
+    p2 = spring or lps
+    if sc and p2:
+        tls.append({"x0":sc["date"],"y0":sc["price"],
+                    "x1":p2["date"],"y1":p2["price"],
+                    "label":"Demand Line","style":"demand"})
+    # Supply line: AR → SOS area (resistance)
+    if ar and sos:
+        tls.append({"x0":ar["date"],"y0":ar["price"],
+                    "x1":sos["date"],"y1":sos["price"],
+                    "label":"Supply Line","style":"supply"})
+    return tls
 
-def analyze_waves(df):
-    closes = df["Close"].values
-    volumes = df["Volume"].values
-    window = 5
-
-    highs_idx, lows_idx = [], []
-    for i in range(window, len(closes) - window):
-        if closes[i] == max(closes[i-window:i+window+1]):
-            highs_idx.append((i, closes[i]))
-        if closes[i] == min(closes[i-window:i+window+1]):
-            lows_idx.append((i, closes[i]))
-
-    trend_strength = "Unknown"
-    if len(highs_idx) >= 2 and len(lows_idx) >= 2:
-        lh = [h[1] for h in highs_idx[-3:]]
-        ll = [l[1] for l in lows_idx[-3:]]
-        if all(lh[i] > lh[i-1] for i in range(1, len(lh))):
-            if all(ll[i] > ll[i-1] for i in range(1, len(ll))):
-                trend_strength = "Strong Uptrend — Rising Highs & Lows"
-            else:
-                trend_strength = "Weakening Uptrend — Lows not rising"
-        elif all(lh[i] < lh[i-1] for i in range(1, len(lh))):
-            if all(ll[i] < ll[i-1] for i in range(1, len(ll))):
-                trend_strength = "Strong Downtrend — Falling Highs & Lows"
-        else:
-            trend_strength = "Sideways / Transition"
-
-    recent_vol = volumes[-20:]
-    vol_trend = "Increasing" if recent_vol[-1] > np.mean(recent_vol) else "Decreasing"
-
-    return {
-        "trend_strength": trend_strength,
-        "recent_volume_trend": vol_trend,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-#  PHASE DETERMINATION
-# ─────────────────────────────────────────────────────────────────
-
-def determine_phase(events):
-    names = [e["event"] for e in events]
-
-    if "SOS" in names or "LPS" in names:
-        return "D-E", "BULLISH"
-    elif "Spring" in names:
-        return "C", "BULLISH"
-    elif "ST" in names and "SC" in names:
-        return "B", "NEUTRAL"
-    elif "AR" in names and "SC" in names:
-        return "A", "NEUTRAL"
-    elif "SOW" in names:
-        return "D", "BEARISH"
-    elif "BC" in names:
-        return "A", "BEARISH"
-    return "?", "NEUTRAL"
-
-
-# ─────────────────────────────────────────────────────────────────
-#  BUILD ZONES FROM EVENTS
-# ─────────────────────────────────────────────────────────────────
-
-def build_zones(events, df):
-    zones = []
-    sc_e = next((e for e in events if e["event"] == "SC"), None)
-    ar_e = next((e for e in events if e["event"] == "AR"), None)
-    sos_e = next((e for e in events if e["event"] == "SOS"), None)
-    bc_e = next((e for e in events if e["event"] == "BC"), None)
-
-    last_date = df.index[-1].strftime("%Y-%m-%d")
-
-    # Accumulation zone between SC and AR
-    if sc_e and ar_e:
-        end_date = sos_e["date"] if sos_e else last_date
-        zones.append({
-            "x0": sc_e["date"],
-            "x1": end_date,
-            "y0": sc_e["price"] * 0.98,
-            "y1": ar_e["price"] * 1.01,
-            "name": "Accumulation TR",
-            "color": "green"
-        })
-
-    # Distribution zone between AR and BC
-    if bc_e:
-        zones.append({
-            "x0": bc_e["date"],
-            "x1": last_date,
-            "y0": bc_e["price"] * 0.95,
-            "y1": bc_e["price"] * 1.02,
-            "name": "Distribution TR",
-            "color": "red"
-        })
-
-    return zones
-
-
-# ─────────────────────────────────────────────────────────────────
-#  BUILD SUPPORT/RESISTANCE LINES
-# ─────────────────────────────────────────────────────────────────
-
+# ── Support lines ─────────────────────────────────────────────────
 def build_support_lines(events):
+    color_map = {"SC":"#e03c3c","AR":"#4fc3f7","Spring":"#a5d6a7",
+                 "SOS":"#43a047","LPS":"#66bb6a","BC":"#ff7043","SOW":"#ef5350"}
+    label_map = {"SC":"SC Support","AR":"AR Resistance","Spring":"Spring Low",
+                 "SOS":"SOS Breakout","LPS":"LPS Support","BC":"BC High","SOW":"SOW"}
     lines = []
     for e in events:
-        if e["event"] == "SC":
-            lines.append({"y": e["price"], "label": f"SC Low ${e['price']:.1f}", "color": "#e03c3c"})
-        elif e["event"] == "AR":
-            lines.append({"y": e["price"], "label": f"AR High ${e['price']:.1f}", "color": "#4fc3f7"})
-        elif e["event"] == "Spring":
-            lines.append({"y": e["price"], "label": f"Spring ${e['price']:.1f}", "color": "#a5d6a7"})
-        elif e["event"] == "SOS":
-            lines.append({"y": e["price"], "label": f"SOS ${e['price']:.1f}", "color": "#43a047"})
-        elif e["event"] == "LPS":
-            lines.append({"y": e["price"], "label": f"LPS ${e['price']:.1f}", "color": "#66bb6a"})
-        elif e["event"] == "BC":
-            lines.append({"y": e["price"], "label": f"BC High ${e['price']:.1f}", "color": "#ff7043"})
-        elif e["event"] == "SOW":
-            lines.append({"y": e["price"], "label": f"SOW ${e['price']:.1f}", "color": "#ef5350"})
+        ev = e["event"]
+        if ev in color_map:
+            lines.append({"y":e["price"],"label":f'{label_map[ev]} ${e["price"]:.1f}',
+                          "color":color_map[ev]})
     return lines
 
+# ── Zones ─────────────────────────────────────────────────────────
+def build_zones(sc, ar, spring, sos, reaccs, df):
+    zones = []
+    last = str(df.index[-1].date())
+    if sc and ar:
+        end = sos["date"] if sos else last
+        zones.append({"x0":sc["date"],"x1":end,
+                      "y0":min(sc["price"],getattr(spring,"__class__",type("",(),{"price":sc["price"]})).__dict__.get("price",sc["price"]) if spring else sc["price"])*0.995,
+                      "y1":ar["price"]*1.005,"name":"Accumulation Zone","color":"green"})
+    for ra in reaccs:
+        zones.append({"x0":ra["x0"],"x1":ra["x1"],
+                      "y0":ra["y0"],"y1":ra["y1"],
+                      "name":"Re-Accumulation","color":"green"})
+    return zones
 
-# ─────────────────────────────────────────────────────────────────
-#  MAIN DETECTOR
-# ─────────────────────────────────────────────────────────────────
+# ── Wave analysis ─────────────────────────────────────────────────
+def analyze_waves(df):
+    c = df["Close"].values; w = 5
+    hi_idx = [i for i in range(w,len(c)-w) if c[i]==max(c[i-w:i+w+1])]
+    lo_idx = [i for i in range(w,len(c)-w) if c[i]==min(c[i-w:i+w+1])]
+    trend = "Unknown"
+    if len(hi_idx)>=2 and len(lo_idx)>=2:
+        lh=[c[i] for i in hi_idx[-3:]]; ll=[c[i] for i in lo_idx[-3:]]
+        rh = all(lh[i]>lh[i-1] for i in range(1,len(lh)))
+        rl = all(ll[i]>ll[i-1] for i in range(1,len(ll)))
+        fh = all(lh[i]<lh[i-1] for i in range(1,len(lh)))
+        fl = all(ll[i]<ll[i-1] for i in range(1,len(ll)))
+        if rh and rl:   trend = "Strong Uptrend — Rising Highs & Lows"
+        elif fh and fl: trend = "Strong Downtrend — Falling Highs & Lows"
+        elif rh:        trend = "Possible Accumulation — Rising Highs"
+        else:           trend = "Sideways / Transition"
+    rv = df["Volume"].values[-20:]
+    return {"trend_strength":trend,
+            "recent_volume_trend":"Increasing" if rv[-1]>np.mean(rv) else "Decreasing"}
 
+# ── Phase determination ───────────────────────────────────────────
+def determine_phase(events):
+    nm = [e["event"] for e in events]
+    if "SOS" in nm or "LPS" in nm: return "D-E","BULLISH"
+    if "Spring" in nm: return "C","BULLISH"
+    if "ST" in nm and "SC" in nm: return "B","NEUTRAL"
+    if "AR" in nm and "SC" in nm: return "A","NEUTRAL"
+    if "BC" in nm: return "A","BEARISH"
+    return "?","NEUTRAL"
+
+# ── MAIN ──────────────────────────────────────────────────────────
 def detect_wyckoff_events(df):
     events = []
     print("🔍 Running Wyckoff event detection...")
 
-    # ── Try Accumulation first ──
     sc = find_SC(df)
-    if sc:
-        events.append(sc)
-        print(f"  ✅ SC  : {sc['date']} @ ${sc['price']}")
+    ar = spring = sos = lps = bc = psy = None
+    reaccs = []
 
+    if sc:
+        events.append(sc); print(f"  ✅ SC     : {sc['date']} @ ${sc['price']}")
         ar = find_AR(df, sc)
         if ar:
-            events.append(ar)
-            print(f"  ✅ AR  : {ar['date']} @ ${ar['price']}")
-
+            events.append(ar); print(f"  ✅ AR     : {ar['date']} @ ${ar['price']}")
             for st in find_STs(df, sc, ar):
-                events.append(st)
-                print(f"  ✅ ST  : {st['date']} @ ${st['price']}")
-
+                events.append(st); print(f"  ✅ ST     : {st['date']} @ ${st['price']}")
             spring = find_Spring(df, sc, ar)
             if spring:
-                events.append(spring)
-                print(f"  ✅ Spring: {spring['date']} @ ${spring['price']}")
-
+                events.append(spring); print(f"  ✅ Spring : {spring['date']} @ ${spring['price']}")
             sos = find_SOS(df, sc, ar)
             if sos:
-                events.append(sos)
-                print(f"  ✅ SOS : {sos['date']} @ ${sos['price']}")
-
+                events.append(sos); print(f"  ✅ SOS    : {sos['date']} @ ${sos['price']}")
                 lps = find_LPS(df, sc, sos)
                 if lps:
-                    events.append(lps)
-                    print(f"  ✅ LPS : {lps['date']} @ ${lps['price']}")
-
-                # Re-accumulation zones
-                for ra in find_reaccumulation(df, sos):
-                    events.append(ra)
-                    print(f"  ✅ ReAcc: {ra['date']} @ ${ra['price']}")
-
-    # ── Try Distribution if no Accumulation ──
-    if not sc:
+                    events.append(lps); print(f"  ✅ LPS    : {lps['date']} @ ${lps['price']}")
+                reaccs = find_reaccumulation(df, sos)
+                for ra in reaccs:
+                    events.append(ra); print(f"  ✅ ReAcc  : {ra['date']} @ ${ra['price']}")
+    else:
         bc = find_BC(df)
         if bc:
-            events.append(bc)
-            print(f"  ✅ BC  : {bc['date']} @ ${bc['price']}")
-
+            events.append(bc); print(f"  ✅ BC     : {bc['date']} @ ${bc['price']}")
             psy = find_PSY(df, bc)
             if psy:
-                events.append(psy)
-                print(f"  ✅ PSY : {psy['date']} @ ${psy['price']}")
+                events.append(psy); print(f"  ✅ PSY    : {psy['date']} @ ${psy['price']}")
 
     phase, bias = determine_phase(events)
-    waves = analyze_waves(df)
-    zones = build_zones(events, df)
+    waves       = analyze_waves(df)
+    zones       = build_zones(sc, ar, spring, sos, reaccs, df)
     support_lines = build_support_lines(events)
-
-    names = [e["event"] for e in events]
-    summary = f"Events: {', '.join(names)}" if names else "No clear Wyckoff events detected"
+    trend_lines   = build_trend_lines(events, sc, ar, spring, sos, lps)
+    phase_labels  = build_phase_labels(events, sc, ar, spring, sos, bc, df)
+    nm = [e["event"] for e in events]
 
     print(f"  📊 Phase: {phase} | Bias: {bias}")
     print(f"  🌊 {waves['trend_strength']}")
 
     return {
-        "events": events,
+        "events":        events,
         "support_lines": support_lines,
-        "trend_lines": [],
-        "zones": zones,
-        "trading_ranges": [],
-        "markup_lines": [],
-        "phase": phase,
-        "bias": bias,
+        "trend_lines":   trend_lines,
+        "zones":         zones,
+        "trading_ranges":[],
+        "markup_lines":  [],
+        "phase_labels":  phase_labels,
+        "phase":  phase,
+        "bias":   bias,
         "wave_analysis": waves,
-        "summary_ar": summary,
+        "summary_ar": f"Events: {', '.join(nm)}" if nm else "No clear Wyckoff events",
         "events_found": len(events) > 0
     }
