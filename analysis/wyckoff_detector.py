@@ -1,16 +1,26 @@
 """
-wyckoff_detector.py — Full chart scan based on Wyckoff SMI Course
+wyckoff_detector.py
+====================
+Methodology (Wyckoff SMI Course):
+1. Scan for TREND CHANGES: Markup → Sideways, Markdown → Sideways
+2. For each Sideways zone → classify: Accumulation / Distribution / ReAcc / ReDist
+3. Detect Wyckoff events INSIDE each zone
 """
 import pandas as pd
 import numpy as np
 
 
-# ─── helpers ──────────────────────────────────────────────────────────────────
-def avg_vol(df, w=20):  return df["Volume"].rolling(w).mean()
-def avg_spd(df, w=20):  return (df["High"]-df["Low"]).rolling(w).mean()
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def avg_vol(df, w=20):   return df["Volume"].rolling(w).mean()
+def avg_spd(df, w=20):   return (df["High"]-df["Low"]).rolling(w).mean()
+
 def close_pos(row):
     r = row["High"]-row["Low"]
     return (row["Close"]-row["Low"])/r if r else 0.5
+
 def vol_rank(df, i, lb=60):
     s = max(0, i-lb)
     return (df["Volume"].iloc[s:i+1] <= df["Volume"].iloc[i]).mean()
@@ -24,205 +34,279 @@ def find_swings(df, w=10):
     return peaks, troughs
 
 
-# ─── SC ───────────────────────────────────────────────────────────────────────
-def find_SC(df):
-    _, troughs = find_swings(df, 10)
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 1 — FIND ALL SIDEWAYS ZONES
+#  Rule: A sideways zone is a period where price oscillates within a range
+#  without making significant new highs or lows.
+#  Detection: Rolling window where (High-Low)/Close < threshold
+# ══════════════════════════════════════════════════════════════════════════════
+
+def find_sideways_zones(df, min_bars=30, range_pct=0.12):
+    """
+    Scans the chart for all consolidation/sideways zones.
+    Returns list of zones with start, end, high, low.
+    """
+    closes = df["Close"].values
+    highs  = df["High"].values
+    lows   = df["Low"].values
+    n = len(df)
+    zones = []
+    i = min_bars
+
+    while i < n - min_bars:
+        # Look for a window where price is contained
+        found = False
+        for width in range(min_bars, min(120, n-i), 5):
+            chunk_hi = max(highs[i:i+width])
+            chunk_lo = min(lows[i:i+width])
+            mid = (chunk_hi + chunk_lo) / 2
+            rng = (chunk_hi - chunk_lo) / mid if mid else 1
+
+            if rng < range_pct:
+                # Extend the zone as far as price stays within ±5%
+                end = i + width
+                while end < n:
+                    new_hi = max(highs[i:end+1])
+                    new_lo = min(lows[i:end+1])
+                    new_rng = (new_hi-new_lo)/((new_hi+new_lo)/2)
+                    if new_rng > range_pct * 1.4:
+                        break
+                    end += 1
+
+                if end - i >= min_bars:
+                    zones.append({
+                        "start": i,
+                        "end":   end,
+                        "x0":    str(df.index[i].date()),
+                        "x1":    str(df.index[min(end, n-1)].date()),
+                        "high":  float(max(highs[i:end])),
+                        "low":   float(min(lows[i:end])),
+                        "bars":  end - i,
+                    })
+                    i = end + 5
+                    found = True
+                    break
+        if not found:
+            i += 5
+
+    # Merge overlapping zones
+    merged = []
+    for z in zones:
+        if merged and z["start"] < merged[-1]["end"] + 10:
+            merged[-1]["end"]  = max(merged[-1]["end"],  z["end"])
+            merged[-1]["x1"]   = str(df.index[min(merged[-1]["end"], n-1)].date())
+            merged[-1]["high"] = max(merged[-1]["high"], z["high"])
+            merged[-1]["low"]  = min(merged[-1]["low"],  z["low"])
+            merged[-1]["bars"] = merged[-1]["end"] - merged[-1]["start"]
+        else:
+            merged.append(z)
+    return merged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 2 — CLASSIFY EACH ZONE
+#  Rules from course:
+#  - After Markdown  + climactic volume at BOTTOM  → Accumulation
+#  - After Markup    + climactic volume at TOP     → Distribution
+#  - During Markup   + tight range + low volume   → Re-Accumulation
+#  - During Markdown + tight range + low volume   → Re-Distribution
+# ══════════════════════════════════════════════════════════════════════════════
+
+def classify_zone(df, zone, lookback=30):
+    """
+    Classify a sideways zone based on:
+    1. What came before it (trend direction)
+    2. Volume at the extremes (climactic at top or bottom)
+    3. Price behavior inside
+    """
+    s, e = zone["start"], zone["end"]
+    n = len(df)
+
+    # ── What was the trend BEFORE this zone? ──
+    before_start = max(0, s - lookback)
+    before_chunk = df.iloc[before_start:s]
+    if len(before_chunk) < 5:
+        prior_trend = "unknown"
+    else:
+        price_change = (before_chunk["Close"].iloc[-1] -
+                        before_chunk["Close"].iloc[0]) / before_chunk["Close"].iloc[0]
+        if price_change > 0.08:
+            prior_trend = "markup"
+        elif price_change < -0.08:
+            prior_trend = "markdown"
+        else:
+            prior_trend = "sideways"
+
+    # ── Zone size relative to price ──
+    zone_range = (zone["high"] - zone["low"]) / ((zone["high"]+zone["low"])/2)
+
+    # ── Volume behavior inside zone ──
+    chunk = df.iloc[s:e]
+    avv_val = float(avg_vol(df, 20).iloc[min(s+10, n-1)])
+    avg_chunk_vol = float(chunk["Volume"].mean())
+    vol_ratio = avg_chunk_vol / avv_val if avv_val > 0 else 1.0
+
+    # ── Climactic bars at extremes ──
+    # Find bar with highest volume in zone
+    max_vol_idx = int(chunk["Volume"].idxmax().name if hasattr(chunk["Volume"].idxmax(),'name') else 0)
+    try:
+        max_vol_loc = chunk["Volume"].idxmax()
+        max_vol_bar = df.index.get_loc(max_vol_loc)
+        max_vol_row = df.iloc[max_vol_bar]
+        climax_at_bottom = max_vol_row["Low"] < (zone["low"] + (zone["high"]-zone["low"])*0.35)
+        climax_at_top    = max_vol_row["High"] > (zone["low"] + (zone["high"]-zone["low"])*0.65)
+    except:
+        climax_at_bottom = False
+        climax_at_top    = False
+
+    # ── Classification logic ──
+    if prior_trend == "markdown" and (climax_at_bottom or zone_range > 0.07):
+        zone_type = "Accumulation"
+    elif prior_trend == "markup" and (climax_at_top or zone_range > 0.07):
+        zone_type = "Distribution"
+    elif prior_trend in ("markup", "sideways") and vol_ratio < 0.85 and zone_range < 0.09:
+        zone_type = "Re-Accumulation"
+    elif prior_trend in ("markdown", "sideways") and vol_ratio < 0.85 and zone_range < 0.09:
+        zone_type = "Re-Distribution"
+    elif prior_trend == "markup" and zone_range > 0.05:
+        zone_type = "Distribution"
+    elif prior_trend == "markdown" and zone_range > 0.05:
+        zone_type = "Accumulation"
+    else:
+        zone_type = "Re-Accumulation"  # default during trend
+
+    zone["type"]        = zone_type
+    zone["prior_trend"] = prior_trend
+    zone["vol_ratio"]   = round(vol_ratio, 2)
+    return zone
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 3 — DETECT EVENTS INSIDE EACH ZONE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_SC_in_zone(df, zone):
+    s, e = zone["start"], zone["end"]
+    chunk = df.iloc[s:e]
     avs = avg_spd(df, 20)
-    best = None
-    for i in troughs:
-        if i < 20 or i > len(df)-5: continue
-        row = df.iloc[i]
-        if df["Close"].iloc[max(0,i-15)] <= row["Close"]*1.04: continue
-        if vol_rank(df, i, 60) < 0.70: continue
-        spread = row["High"]-row["Low"]
-        if avs.iloc[i] > 0 and spread < avs.iloc[i]*0.85: continue
+    for date, row in chunk.iterrows():
+        i = df.index.get_loc(date)
+        if row["Low"] > zone["low"] * 1.02: continue
+        if vol_rank(df, i, 60) < 0.65: continue
         if close_pos(row) < 0.38: continue
-        nxt = df["Close"].iloc[i+1:i+6]
-        if (nxt > row["Close"]).sum() < 2: continue
-        if best is None or row["Volume"] > best["volume"]:
-            best = {"event":"SC","date":str(df.index[i].date()),
-                    "price":round(float(row["Low"]),2),
-                    "volume":int(row["Volume"]),"bar_index":i}
-    return best
+        return {"event":"SC","date":str(date.date()),
+                "price":round(float(row["Low"]),2),
+                "volume":int(row["Volume"]),"bar_index":i}
+    return None
 
+def detect_BC_in_zone(df, zone):
+    s, e = zone["start"], zone["end"]
+    chunk = df.iloc[s:e]
+    for date, row in chunk.iterrows():
+        i = df.index.get_loc(date)
+        if row["High"] < zone["high"] * 0.98: continue
+        if vol_rank(df, i, 60) < 0.65: continue
+        if close_pos(row) > 0.55: continue
+        return {"event":"BC","date":str(date.date()),
+                "price":round(float(row["High"]),2),
+                "volume":int(row["Volume"]),"bar_index":i}
+    return None
 
-# ─── AR ───────────────────────────────────────────────────────────────────────
-def find_AR(df, sc):
+def detect_AR_after_SC(df, sc, zone_end):
     if not sc: return None
     si = sc["bar_index"]
-    seg = df.iloc[si+1:si+30]
+    seg = df.iloc[si+1:min(si+30, zone_end)]
     if seg.empty: return None
     loc = seg["High"].idxmax(); ai = df.index.get_loc(loc)
     row = df.iloc[ai]
-    if row["High"] < df.iloc[si]["Low"]*1.03: return None
     return {"event":"AR","date":str(df.index[ai].date()),
             "price":round(float(row["High"]),2),
             "volume":int(row["Volume"]),"bar_index":ai}
 
+def detect_AR_after_BC(df, bc, zone_end):
+    if not bc: return None
+    bi = bc["bar_index"]
+    seg = df.iloc[bi+1:min(bi+30, zone_end)]
+    if seg.empty: return None
+    loc = seg["Low"].idxmin(); ai = df.index.get_loc(loc)
+    row = df.iloc[ai]
+    return {"event":"AR","date":str(df.index[ai].date()),
+            "price":round(float(row["Low"]),2),
+            "volume":int(row["Volume"]),"bar_index":ai}
 
-# ─── STs ──────────────────────────────────────────────────────────────────────
-def find_STs(df, sc, ar):
-    if not sc or not ar: return []
-    ai, sl, sv = ar["bar_index"], sc["price"], sc["volume"]
-    sts = []
-    for date, row in df.iloc[ai+1:ai+120].iterrows():
-        i = df.index.get_loc(date)
-        if abs(row["Low"]-sl)/sl < 0.06 and row["Volume"] < sv*0.9 and row["Low"] >= sl*0.96:
-            sts.append({"event":"ST","date":str(date.date()),
-                        "price":round(float(row["Low"]),2),
-                        "volume":int(row["Volume"]),"bar_index":i})
-            if len(sts) >= 3: break
-    return sts
-
-
-# ─── Spring ───────────────────────────────────────────────────────────────────
-def find_Spring(df, sc, ar):
+def detect_Spring(df, sc, ar, zone_end):
     if not sc or not ar: return None
     ai, sl, sv = ar["bar_index"], sc["price"], sc["volume"]
-    # Must be at least 10 bars after AR to avoid overlap with ST
-    for date, row in df.iloc[ai+10:ai+150].iterrows():
+    for date, row in df.iloc[ai+5:zone_end].iterrows():
         i = df.index.get_loc(date)
-        if row["Low"] < sl and row["Volume"] < sv and row["Close"] > sl:
+        if row["Low"] < sl and row["Volume"] < sv*1.1 and row["Close"] > sl:
             return {"event":"Spring","date":str(date.date()),
                     "price":round(float(row["Low"]),2),
                     "volume":int(row["Volume"]),"bar_index":i}
     return None
 
-
-# ─── SOS — search the ENTIRE chart after AR ──────────────────────────────────
-def find_SOS(df, sc, ar):
-    if not sc or not ar: return None
+def detect_SOS(df, ar, zone_end):
+    if not ar: return None
     ai, ah = ar["bar_index"], ar["price"]
     avv, avs = avg_vol(df,20), avg_spd(df,20)
-    # Search ALL remaining bars after AR (not just 120!)
-    for date, row in df.iloc[ai+20:].iterrows():
+    # Search from zone end onwards (SOS breaks OUT of the zone)
+    for date, row in df.iloc[zone_end:zone_end+200].iterrows():
         i = df.index.get_loc(date)
         sp = row["High"]-row["Low"]
-        if (row["High"] > ah*1.02 and
-            avs.iloc[i] > 0 and sp > avs.iloc[i]*0.85 and
-            avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*1.05 and
-            close_pos(row) > 0.55):
+        if (row["High"] > ah*1.01 and
+            avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*1.0 and
+            close_pos(row) > 0.50):
             return {"event":"SOS","date":str(date.date()),
                     "price":round(float(row["High"]),2),
                     "volume":int(row["Volume"]),"bar_index":i}
     return None
 
-
-# ─── LPS ──────────────────────────────────────────────────────────────────────
-def find_LPS(df, sc, sos):
-    if not sc or not sos: return None
-    _, troughs = find_swings(df, 5)
+def detect_SOW(df, ar_dist, zone_end):
+    if not ar_dist: return None
+    ai, al = ar_dist["bar_index"], ar_dist["price"]
     avv = avg_vol(df, 20)
-    for i in troughs:
-        if i <= sos["bar_index"] or i >= len(df)-3: continue
-        row = df.iloc[i]
-        if row["Low"] < sc["price"]: continue
-        if avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*0.95: continue
-        return {"event":"LPS","date":str(df.index[i].date()),
-                "price":round(float(row["Low"]),2),
-                "volume":int(row["Volume"]),"bar_index":i}
+    for date, row in df.iloc[zone_end:zone_end+200].iterrows():
+        i = df.index.get_loc(date)
+        if (row["Low"] < al*0.99 and
+            avv.iloc[i] > 0 and row["Volume"] > avv.iloc[i]*1.0 and
+            close_pos(row) < 0.50):
+            return {"event":"SOW","date":str(date.date()),
+                    "price":round(float(row["Low"]),2),
+                    "volume":int(row["Volume"]),"bar_index":i}
     return None
 
 
-# ─── Re-Accumulation zones (scan markup phase) ────────────────────────────────
-def find_reaccumulation(df, sos):
-    """
-    Finds consolidation zones during markup.
-    Rules (Section on Re-Accumulation):
-    - Tight price range during an uptrend
-    - Decreasing volume = absorption
-    - Similar structure to accumulation but shorter
-    """
-    if not sos: return []
-    results = []
-    avv = avg_vol(df, 20)
-    w = 30   # window size per zone
-    step = 20
-    i = sos["bar_index"] + 30
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 4 — BUILD ZONE BOXES FOR CHART
+# ══════════════════════════════════════════════════════════════════════════════
 
-    while i < len(df) - w:
-        chunk = df.iloc[i:i+w]
-        hi = float(chunk["High"].max())
-        lo = float(chunk["Low"].min())
-        mid = float(chunk["Close"].mean())
-        rng = (hi - lo) / mid if mid else 1
+ZONE_COLORS = {
+    "Accumulation":    "#4fc3f7",
+    "Distribution":    "#e03c3c",
+    "Re-Accumulation": "#26c6da",
+    "Re-Distribution": "#ff7043",
+}
 
-        # Get avg volume for this period
-        av = float(avv.iloc[i+w//2]) if avv.iloc[i+w//2] > 0 else 1
-        cv = float(chunk["Volume"].mean())
-
-        # Re-Acc: tight range (<10%) + volume < average
-        if rng < 0.10 and cv < av * 0.90:
-            x0_date = str(df.index[i].date())
-            x1_date = str(df.index[min(i+w, len(df)-1)].date())
-            results.append({
-                "event": "ReAcc",
-                "date":  str(df.index[i+w//2].date()),
-                "price": round(mid, 2),
-                "volume": int(cv),
-                "bar_index": i+w//2,
-                "x0": x0_date,
-                "x1": x1_date,
-                "y0": round(lo * 0.995, 2),
-                "y1": round(hi * 1.005, 2),
-            })
-            i += w + 10   # skip ahead after finding a zone
-            if len(results) >= 4: break
-        else:
-            i += step
-
-    return results
+def build_zone_boxes(classified_zones, df):
+    boxes = []
+    for z in classified_zones:
+        col = ZONE_COLORS.get(z["type"], "#90caf9")
+        boxes.append({
+            "x0":    z["x0"],
+            "x1":    z["x1"],
+            "y0":    round(z["low"]  * 0.995, 2),
+            "y1":    round(z["high"] * 1.005, 2),
+            "label": z["type"],
+            "color": col,
+            "vol_ratio": z.get("vol_ratio", 1.0),
+        })
+    return boxes
 
 
-# ─── BC / PSY ─────────────────────────────────────────────────────────────────
-def find_BC(df):
-    peaks, _ = find_swings(df, 10)
-    avs = avg_spd(df, 20)
-    best = None
-    for i in peaks:
-        if i < 20 or i > len(df)-5: continue
-        row = df.iloc[i]
-        if df["Close"].iloc[max(0,i-15)] >= row["Close"]*0.96: continue
-        if vol_rank(df, i, 60) < 0.70: continue
-        sp = row["High"]-row["Low"]
-        if avs.iloc[i] > 0 and sp < avs.iloc[i]*0.85: continue
-        if close_pos(row) > 0.55: continue
-        if best is None or row["Volume"] > best["volume"]:
-            best = {"event":"BC","date":str(df.index[i].date()),
-                    "price":round(float(row["High"]),2),
-                    "volume":int(row["Volume"]),"bar_index":i}
-    return best
+# ══════════════════════════════════════════════════════════════════════════════
+#  WAVE ANALYSIS (Section 5M)
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# ─── Phase determination ──────────────────────────────────────────────────────
-def determine_phase(events):
-    nm = [e["event"] for e in events]
-    if "SOS" in nm or "LPS" in nm: return "D-E","BULLISH"
-    if "Spring" in nm:              return "C",  "BULLISH"
-    if "ST" in nm and "SC" in nm:   return "B",  "NEUTRAL"
-    if "AR" in nm and "SC" in nm:   return "A",  "NEUTRAL"
-    if "BC" in nm:                  return "A",  "BEARISH"
-    return "?","NEUTRAL"
-
-
-# ─── Phase labels for chart ───────────────────────────────────────────────────
-def build_phase_labels(sc, ar, spring, sos, bc, df):
-    labels = []
-    last = str(df.index[-1].date())
-    if sc and ar:
-        labels.append({"text":"Phase A","x0":sc["date"],"x1":ar["date"],"color":"#e53935"})
-    if ar and spring:
-        labels.append({"text":"Phase B","x0":ar["date"],"x1":spring["date"],"color":"#fb8c00"})
-    if spring and sos:
-        labels.append({"text":"Phase C","x0":spring["date"],"x1":sos["date"],"color":"#fdd835"})
-    elif spring:
-        labels.append({"text":"Phase C","x0":spring["date"],"x1":last,"color":"#fdd835"})
-    if sos:
-        labels.append({"text":"Phase D→E  Markup","x0":sos["date"],"x1":last,"color":"#43a047"})
-    return labels
-
-
-# ─── Wave analysis ────────────────────────────────────────────────────────────
 def analyze_waves(df):
     c = df["Close"].values; w = 5
     hi_idx = [i for i in range(w,len(c)-w) if c[i]==max(c[i-w:i+w+1])]
@@ -236,84 +320,124 @@ def analyze_waves(df):
         fl=all(ll[i]<ll[i-1] for i in range(1,len(ll)))
         if rh and rl:   trend="Strong Uptrend — Rising Highs & Lows"
         elif fh and fl: trend="Strong Downtrend — Falling Highs & Lows"
-        elif rh:        trend="Possible Accumulation — Rising Highs"
         else:           trend="Sideways / Transition"
     rv = df["Volume"].values[-20:]
     return {"trend_strength":trend,
             "recent_volume_trend":"Increasing" if rv[-1]>np.mean(rv) else "Decreasing"}
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 def detect_wyckoff_events(df):
     events = []
-    print("🔍 Running Wyckoff event detection...")
+    print("🔍 Wyckoff event detection — full chart scan...")
 
-    sc = find_SC(df)
-    ar = spring = sos = lps = bc = None
-    reaccs = []
+    # ── STEP 1: Find all sideways zones ──────────────────────────────────────
+    zones = find_sideways_zones(df, min_bars=25, range_pct=0.11)
+    print(f"  📦 Sideways zones found: {len(zones)}")
 
-    if sc:
-        events.append(sc)
-        print(f"  ✅ SC      : {sc['date']} @ ${sc['price']}")
+    # ── STEP 2: Classify each zone ───────────────────────────────────────────
+    classified = []
+    for z in zones:
+        z = classify_zone(df, z)
+        classified.append(z)
+        print(f"  🏷️  [{z['type']:18s}] {z['x0']} → {z['x1']}  "
+              f"${z['low']:.0f}–${z['high']:.0f}  "
+              f"prior={z['prior_trend']}  vol={z['vol_ratio']:.2f}x")
 
-        ar = find_AR(df, sc)
-        if ar:
-            events.append(ar)
-            print(f"  ✅ AR      : {ar['date']} @ ${ar['price']}")
+    # ── STEP 3: Detect events inside each zone ───────────────────────────────
+    for z in classified:
+        s, e = z["start"], z["end"]
+        ztype = z["type"]
 
-            for st in find_STs(df, sc, ar):
-                events.append(st)
-                print(f"  ✅ ST      : {st['date']} @ ${st['price']}")
+        if ztype == "Accumulation":
+            sc = detect_SC_in_zone(df, z)
+            if sc:
+                events.append(sc)
+                ar = detect_AR_after_SC(df, sc, e)
+                if ar:
+                    events.append(ar)
+                    sp = detect_Spring(df, sc, ar, e)
+                    if sp: events.append(sp)
+                    sos = detect_SOS(df, ar, e)
+                    if sos: events.append(sos)
 
-            spring = find_Spring(df, sc, ar)
-            if spring:
-                events.append(spring)
-                print(f"  ✅ Spring  : {spring['date']} @ ${spring['price']}")
+        elif ztype == "Distribution":
+            bc = detect_BC_in_zone(df, z)
+            if bc:
+                events.append(bc)
+                ar_d = detect_AR_after_BC(df, bc, e)
+                if ar_d:
+                    events.append(ar_d)
+                    sow = detect_SOW(df, ar_d, e)
+                    if sow: events.append(sow)
 
-            # Search ENTIRE remaining chart for SOS
-            sos = find_SOS(df, sc, ar)
-            if sos:
-                events.append(sos)
-                print(f"  ✅ SOS     : {sos['date']} @ ${sos['price']}")
+        elif ztype == "Re-Accumulation":
+            # Mark the zone center as a ReAcc event
+            mid_i = (s + e) // 2
+            events.append({
+                "event":     "ReAcc",
+                "date":      str(df.index[mid_i].date()),
+                "price":     round(float(df["Close"].iloc[mid_i]), 2),
+                "volume":    int(df["Volume"].iloc[mid_i]),
+                "bar_index": mid_i,
+                "x0": z["x0"], "x1": z["x1"],
+                "y0": round(z["low"]*0.995,2),
+                "y1": round(z["high"]*1.005,2),
+            })
 
-                lps = find_LPS(df, sc, sos)
-                if lps:
-                    events.append(lps)
-                    print(f"  ✅ LPS     : {lps['date']} @ ${lps['price']}")
+        elif ztype == "Re-Distribution":
+            mid_i = (s + e) // 2
+            events.append({
+                "event":     "ReDist",
+                "date":      str(df.index[mid_i].date()),
+                "price":     round(float(df["Close"].iloc[mid_i]), 2),
+                "volume":    int(df["Volume"].iloc[mid_i]),
+                "bar_index": mid_i,
+                "x0": z["x0"], "x1": z["x1"],
+                "y0": round(z["low"]*0.995,2),
+                "y1": round(z["high"]*1.005,2),
+            })
 
-                # Find all Re-Accumulation zones in markup
-                reaccs = find_reaccumulation(df, sos)
-                for ra in reaccs:
-                    events.append(ra)
-                    print(f"  ✅ ReAcc   : {ra['date']} @ ${ra['price']:.0f}  [{ra['x0']} → {ra['x1']}]")
-            else:
-                print(f"  ⚠️  SOS not found — accumulation may still be in progress")
-    else:
-        bc = find_BC(df)
-        if bc:
-            events.append(bc)
-            print(f"  ✅ BC      : {bc['date']} @ ${bc['price']}")
-
-    phase, bias = determine_phase(events)
-    waves = analyze_waves(df)
-    phase_labels = build_phase_labels(sc, ar, spring, sos, bc, df)
+    # ── Determine bias from events ────────────────────────────────────────────
     nm = [e["event"] for e in events]
+    has_acc  = any(z["type"]=="Accumulation" for z in classified)
+    has_dist = any(z["type"]=="Distribution" for z in classified)
+    last_z   = classified[-1]["type"] if classified else ""
 
-    print(f"  📊 Phase: {phase} | Bias: {bias}")
+    if "SOS" in nm:
+        phase, bias = "D-E", "BULLISH"
+    elif "Spring" in nm or has_acc:
+        phase, bias = "C",   "BULLISH"
+    elif "SOW" in nm or has_dist:
+        phase, bias = "D",   "BEARISH"
+    elif "ReAcc" in nm:
+        phase, bias = "E",   "BULLISH"
+    else:
+        phase, bias = "?",   "NEUTRAL"
+
+    waves = analyze_waves(df)
+    zone_boxes = build_zone_boxes(classified, df)
+
+    print(f"\n  📊 Phase: {phase} | Bias: {bias}")
     print(f"  🌊 {waves['trend_strength']}")
-    print(f"  📦 Re-Acc zones found: {len(reaccs)}")
+    print(f"  📋 Events: {', '.join(nm) if nm else 'None'}")
 
     return {
-        "events":       events,
-        "support_lines":[],
-        "trend_lines":  [],
-        "zones":        [],
+        "events":        events,
+        "zone_boxes":    zone_boxes,
+        "classified_zones": classified,
+        "support_lines": [],
+        "trend_lines":   [],
+        "zones":         [],
         "trading_ranges":[],
-        "markup_lines": [],
-        "phase_labels": phase_labels,
+        "markup_lines":  [],
+        "phase_labels":  [],
         "phase":  phase,
         "bias":   bias,
         "wave_analysis": waves,
-        "summary_ar": f"Events: {', '.join(nm)}" if nm else "No clear Wyckoff events",
+        "summary_ar": f"Events: {', '.join(nm)}" if nm else "No events",
         "events_found": len(events) > 0
     }
