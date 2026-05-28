@@ -89,31 +89,39 @@ def draw_chart(ticker, df, analysis):
 
     # ── Zone BOXES ────────────────────────────────────────────────────────────
     def draw_box(x0, x1, y0, y1, col, alpha, label):
+        """Draw box with EXACT highs and lows — no padding."""
+        # Recalculate exact high/low from actual price data within x0:x1
+        chunk = df.iloc[x0:x1+1]
+        exact_high = float(chunk["High"].max())
+        exact_low  = float(chunk["Low"].min())
+        y0 = exact_low
+        y1 = exact_high
+
         # Fill
         rect = mpatches.Rectangle((x0, y0), x1-x0, y1-y0,
                                    linewidth=0, facecolor=col,
                                    alpha=alpha, zorder=1)
         ax.add_patch(rect)
-        # Top border
-        ax.plot([x0,x1],[y1,y1], color=col, lw=2.0, ls="--", alpha=0.85, zorder=3)
-        # Bottom border
-        ax.plot([x0,x1],[y0,y0], color=col, lw=2.0, ls="--", alpha=0.85, zorder=3)
+        # Top border — solid line on exact high
+        ax.plot([x0,x1],[y1,y1], color=col, lw=2.2, ls="-", alpha=0.90, zorder=3)
+        # Bottom border — solid line on exact low
+        ax.plot([x0,x1],[y0,y0], color=col, lw=2.2, ls="-", alpha=0.90, zorder=3)
         # Left border
-        ax.plot([x0,x0],[y0,y1], color=col, lw=1.5, ls="-",  alpha=0.65, zorder=3)
+        ax.plot([x0,x0],[y0,y1], color=col, lw=1.5, ls="-", alpha=0.60, zorder=3)
         # Right border
-        ax.plot([x1,x1],[y0,y1], color=col, lw=1.5, ls="-",  alpha=0.65, zorder=3)
-        # Label top-left corner
+        ax.plot([x1,x1],[y0,y1], color=col, lw=1.5, ls="-", alpha=0.60, zorder=3)
+        # Label top-left
         ax.text(x0+(x1-x0)*0.02, y1, f" {label} ",
                 color="white", fontsize=8, fontweight="bold",
                 va="top", ha="left", zorder=6,
                 bbox=dict(boxstyle="round,pad=0.3",
                           facecolor=col, edgecolor="none", alpha=0.92))
-        # Price tags right side — only if box is wide enough
+        # Price tags right side
         if x1 - x0 > 10:
-            ax.text(x1+1, y1, f"${y1:.0f}", color=col,
-                    fontsize=7, fontweight="bold", va="center", zorder=5)
-            ax.text(x1+1, y0, f"${y0:.0f}", color=col,
-                    fontsize=7, fontweight="bold", va="center", zorder=5)
+            ax.text(x1+2, y1, f"${y1:.0f}", color=col,
+                    fontsize=7.5, fontweight="bold", va="center", zorder=5)
+            ax.text(x1+2, y0, f"${y0:.0f}", color=col,
+                    fontsize=7.5, fontweight="bold", va="center", zorder=5)
 
     for z in zone_boxes:
         x0 = bx(z["x0"]); x1 = bx(z["x1"])
