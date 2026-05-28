@@ -246,6 +246,27 @@ def draw_chart(ticker, df, analysis):
                     bbox=dict(boxstyle="round,pad=0.2",
                               facecolor=col, edgecolor="none", alpha=0.75))
 
+    # ── Phase Labels (A, B, C, D-E) ──────────────────────────────────────────
+    phase_labels = analysis.get("phase_labels", [])
+    ax2 = axes[0]
+    y_phase = BOT_R1 - y_range * 0.01   # just below bottom band
+
+    for pl in phase_labels:
+        x0 = bx(pl["x0"]); x1 = bx(pl["x1"])
+        col = pl.get("color", "#4fc3f7")
+        xmid = (x0 + x1) // 2
+        # Shaded vertical band
+        ax2.axvspan(x0, x1, alpha=0.06, color=col, zorder=0)
+        # Top divider line
+        ax2.axvline(x0, color=col, linewidth=1.0, linestyle=":", alpha=0.5, zorder=2)
+        # Phase label at bottom
+        ax2.text(xmid, y_phase, pl["text"],
+                 color=col, fontsize=8, fontweight="bold",
+                 ha="center", va="center", zorder=10,
+                 bbox=dict(boxstyle="round,pad=0.35",
+                           facecolor="#0d1421", edgecolor=col,
+                           linewidth=1.2, alpha=0.95))
+
     # ── Header ────────────────────────────────────────────────────────────────
     fig.text(0.12, 0.97,
              f"  {ticker}  —  Wyckoff Analysis  [{bias}  Phase {phase}]  ",
