@@ -113,6 +113,7 @@ def find_sideways_zones(df, min_bars=30, range_pct=0.12):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def classify_zone(df, zone, lookback=30):
+    len_df = len(df)
     """
     Classify a sideways zone based on:
     1. What came before it (trend direction)
@@ -160,20 +161,39 @@ def classify_zone(df, zone, lookback=30):
         climax_at_top    = False
 
     # ── Classification logic ──
-    if prior_trend == "markdown" and (climax_at_bottom or zone_range > 0.07):
+    # Primary classification based on prior trend direction
+    if prior_trend == "markdown":
+        # After a downtrend = Accumulation (always)
         zone_type = "Accumulation"
-    elif prior_trend == "markup" and (climax_at_top or zone_range > 0.07):
+    elif prior_trend == "markup":
+        # After an uptrend = Distribution (always)
         zone_type = "Distribution"
-    elif prior_trend in ("markup", "sideways") and vol_ratio < 0.85 and zone_range < 0.09:
-        zone_type = "Re-Accumulation"
-    elif prior_trend in ("markdown", "sideways") and vol_ratio < 0.85 and zone_range < 0.09:
-        zone_type = "Re-Distribution"
-    elif prior_trend == "markup" and zone_range > 0.05:
-        zone_type = "Distribution"
-    elif prior_trend == "markdown" and zone_range > 0.05:
-        zone_type = "Accumulation"
+    elif prior_trend == "sideways":
+        # During sideways — use volume and range to determine
+        if vol_ratio < 0.85 and zone_range < 0.09:
+            zone_type = "Re-Accumulation"
+        else:
+            zone_type = "Re-Accumulation"
     else:
-        zone_type = "Re-Accumulation"  # default during trend
+        # Unknown prior — use volume hint
+        if vol_ratio > 1.2:
+            zone_type = "Accumulation"
+        else:
+            zone_type = "Re-Accumulation"
+
+    # Override: if zone is SMALL and tight during a clear uptrend = Re-Accumulation
+    # Check if price after zone is higher than before = markup context
+    after_end = min(zone["end"]+30, len_df-1)
+    before_start_price = df["Close"].iloc[max(0,zone["start"]-30)] if zone["start"] > 0 else df["Close"].iloc[0]
+    zone_mid_price = (zone["high"]+zone["low"])/2
+    if (zone_type == "Accumulation" and
+        zone_range < 0.10 and
+        zone_mid_price > before_start_price * 1.10):
+        zone_type = "Re-Accumulation"
+    if (zone_type == "Distribution" and
+        zone_range < 0.10 and
+        zone_mid_price < before_start_price * 0.90):
+        zone_type = "Re-Distribution"
 
     zone["type"]        = zone_type
     zone["prior_trend"] = prior_trend
