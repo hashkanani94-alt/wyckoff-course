@@ -122,15 +122,7 @@ def draw_chart(ticker, df, analysis):
         band_y = BOT_R0 if i % 2 == 0 else BOT_R1
         place_label(b, band_y, dot_y, lbl, col)
 
-    # ── Auto horizontal lines from key events ────────────────────────────────
-    def hline(price, color, label):
-        ax.axhline(price, color=color, linewidth=1.0,
-                   linestyle="--", alpha=0.5, zorder=2)
-        ax.text(n - 1, price, f"  {label}  ",
-                color=color, fontsize=7, va="center", ha="left", zorder=5,
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="#0d1421",
-                          edgecolor=color, linewidth=0.6, alpha=0.85))
-
+    # ── NO infinite horizontal lines — use bounded lines inside TR only ─────
     sc_evts     = [e for e in events if e["event"] == "SC"]
     ar_evts     = [e for e in events if e["event"] == "AR"]
     bc_evts     = [e for e in events if e["event"] == "BC"]
@@ -138,40 +130,93 @@ def draw_chart(ticker, df, analysis):
     lps_evts    = [e for e in events if e["event"] == "LPS"]
     ut_evts     = [e for e in events if e["event"] in ["UT","UTAD"]]
     lpsy_evts   = [e for e in events if e["event"] == "LPSY"]
+    sos_evts    = [e for e in events if e["event"] == "SOS"]
 
-    for e in sc_evts:
-        hline(e["price"], "#e03c3c", f'SC Low ${e["price"]:.1f}')
-    for e in ar_evts:
-        hline(e["price"], "#4fc3f7", f'AR High ${e["price"]:.1f}')
-    for e in bc_evts:
-        hline(e["price"], "#ff7043", f'BC High ${e["price"]:.1f}')
-    for e in spring_evts:
-        hline(e["price"], "#a5d6a7", f'Spring ${e["price"]:.1f}')
-    for e in lps_evts:
-        hline(e["price"], "#66bb6a", f'LPS ${e["price"]:.1f}')
+    def draw_tr_box(x0, x1, y_bot, y_top, col, label):
+        """Draw a clean box for a trading range."""
+        import matplotlib.patches as mpatches
+        # Filled rectangle
+        rect = mpatches.FancyBboxPatch(
+            (x0, y_bot), x1 - x0, y_top - y_bot,
+            boxstyle="square,pad=0",
+            linewidth=1.8, edgecolor=col,
+            facecolor=col, alpha=0.07, zorder=1)
+        ax.add_patch(rect)
+        # Top border line
+        ax.plot([x0, x1], [y_top, y_top], color=col,
+                linewidth=1.6, linestyle="--", alpha=0.75, zorder=3)
+        # Bottom border line
+        ax.plot([x0, x1], [y_bot, y_bot], color=col,
+                linewidth=1.6, linestyle="--", alpha=0.75, zorder=3)
+        # Left border
+        ax.plot([x0, x0], [y_bot, y_top], color=col,
+                linewidth=1.2, linestyle="-", alpha=0.5, zorder=3)
+        # Right border
+        ax.plot([x1, x1], [y_bot, y_top], color=col,
+                linewidth=1.2, linestyle="-", alpha=0.5, zorder=3)
+        # Label inside top-left
+        ax.text(x0 + (x1-x0)*0.03, y_top,
+                f" {label} ", color="white", fontsize=8,
+                fontweight="bold", va="top", ha="left", zorder=6,
+                bbox=dict(boxstyle="round,pad=0.3",
+                          facecolor=col, edgecolor="none", alpha=0.9))
+        # Price labels on right edge
+        ax.text(x1 + 1, y_top, f"${y_top:.1f}",
+                color=col, fontsize=7, va="center", ha="left", zorder=5)
+        ax.text(x1 + 1, y_bot, f"${y_bot:.1f}",
+                color=col, fontsize=7, va="center", ha="left", zorder=5)
 
-    # Demand line: SC → Spring or LPS
+    # Draw Accumulation TR box
+    if sc_evts and ar_evts:
+        sc_e = sc_evts[0]; ar_e = ar_evts[0]
+        sp_e = spring_evts[0] if spring_evts else None
+        sos_e = sos_evts[0] if sos_evts else None
+        x0 = bx(sc_e["date"])
+        x1 = bx(sos_e["date"]) if sos_e else min(bx(sc_e["date"]) + 300, n-1)
+        y_bot = (sp_e["price"] if sp_e else sc_e["price"]) * 0.995
+        y_top = ar_e["price"] * 1.005
+        draw_tr_box(x0, x1, y_bot, y_top, "#4fc3f7", "Accumulation TR")
+
+    # Draw Distribution TR box
+    if bc_evts:
+        bc_e = bc_evts[0]
+        x0 = bx(bc_e["date"]) - 20
+        x1 = min(bx(bc_e["date"]) + 120, n-1)
+        ar_dist = [e for e in events if e["event"]=="AR" and
+                   e["bar_index"] > bc_e["bar_index"]]
+        y_bot = (ar_dist[0]["price"] if ar_dist else bc_e["price"]*0.94) * 0.995
+        y_top = bc_e["price"] * 1.005
+        draw_tr_box(x0, x1, y_bot, y_top, "#e03c3c", "Distribution TR")
+
+    # Draw Re-Accumulation boxes
+    reacc_evts = [e for e in events if e["event"] == "ReAcc"]
+    for ra in reacc_evts:
+        if "x0" in ra and "x1" in ra:
+            draw_tr_box(bx(ra["x0"]), bx(ra["x1"]),
+                        ra["y0"], ra["y1"], "#43a047", "Re-Acc")
+
+    # Demand line: SC → Spring (bounded, not infinite)
     if sc_evts and (spring_evts or lps_evts):
         p1 = sc_evts[0]
         p2 = (spring_evts + lps_evts)[0]
         x0, x1 = bx(p1["date"]), bx(p2["date"])
         ax.plot([x0, x1], [p1["price"], p2["price"]],
-                color="#2eb872", linewidth=1.5, linestyle="-",
-                alpha=0.7, zorder=3)
+                color="#2eb872", linewidth=1.8, linestyle="-",
+                alpha=0.85, zorder=3)
         ax.text((x0+x1)//2, (p1["price"]+p2["price"])/2,
                 " Demand Line ", color="white", fontsize=7,
                 ha="center", va="bottom", zorder=5,
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#2eb872",
-                          edgecolor="none", alpha=0.8))
+                          edgecolor="none", alpha=0.85))
 
-    # Supply line: BC → UT or LPSY
+    # Supply line: BC → UT or LPSY (bounded)
     if bc_evts and (ut_evts or lpsy_evts):
         p1 = bc_evts[0]
         p2 = (ut_evts + lpsy_evts)[0]
         x0, x1 = bx(p1["date"]), bx(p2["date"])
         ax.plot([x0, x1], [p1["price"], p2["price"]],
-                color="#e03c3c", linewidth=1.5, linestyle="-",
-                alpha=0.7, zorder=3)
+                color="#e03c3c", linewidth=1.8, linestyle="-",
+                alpha=0.85, zorder=3)
         ax.text((x0+x1)//2, (p1["price"]+p2["price"])/2,
                 " Supply Line ", color="white", fontsize=7,
                 ha="center", va="top", zorder=5,
@@ -206,19 +251,7 @@ def draw_chart(ticker, df, analysis):
                 bbox=dict(boxstyle="round,pad=0.3",
                           facecolor="#f5c842", edgecolor="none", alpha=0.92))
 
-    # ── Zones ─────────────────────────────────────────────────────────────────
-    for z in zones:
-        x0 = bx(z["x0"]); x1 = bx(z["x1"])
-        col, alpha = ZONE_COLORS.get(z.get("color","red"), ("#c62828",0.13))
-        ax.fill_betweenx([z["y0"], z["y1"]], x0, x1,
-                          alpha=alpha, color=col, zorder=1)
-        ax.hlines([z["y0"], z["y1"]], x0, x1,
-                   colors=col, linewidths=1.1, alpha=0.65, zorder=2)
-        ax.text(x0 + 0.5, z["y1"], f' {z["name"]} ',
-                color="white", fontsize=7, fontweight="bold",
-                va="bottom", ha="left", zorder=5,
-                bbox=dict(boxstyle="round,pad=0.2",
-                          facecolor=col, edgecolor="none", alpha=0.85))
+    # ── Zones — skipped, TR boxes drawn above ────────────────────────────────
 
     # ── Extra support lines ───────────────────────────────────────────────────
     for sl in supports:
