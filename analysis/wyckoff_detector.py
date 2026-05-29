@@ -161,39 +161,56 @@ def classify_zone(df, zone, lookback=30):
         climax_at_top    = False
 
     # ── Classification logic ──
-    # Primary classification based on prior trend direction
-    if prior_trend == "markdown":
-        # After a downtrend = Accumulation (always)
-        zone_type = "Accumulation"
-    elif prior_trend == "markup":
-        # After an uptrend = Distribution (always)
-        zone_type = "Distribution"
-    elif prior_trend == "sideways":
-        # During sideways — use volume and range to determine
-        if vol_ratio < 0.85 and zone_range < 0.09:
-            zone_type = "Re-Accumulation"
-        else:
-            zone_type = "Re-Accumulation"
+    # ── What happens AFTER the zone? ──
+    after_end   = min(zone["end"] + lookback, len_df - 1)
+    after_chunk = df.iloc[zone["end"]:after_end]
+    if len(after_chunk) >= 5:
+        after_change = ((after_chunk["Close"].iloc[-1] -
+                         after_chunk["Close"].iloc[0]) /
+                        after_chunk["Close"].iloc[0])
     else:
-        # Unknown prior — use volume hint
-        if vol_ratio > 1.2:
+        after_change = 0.0
+
+    zone_mid = (zone["high"] + zone["low"]) / 2
+
+    # ── Classification Rules ──
+    # Rule 1: First zone in chart (no prior trend data) — use after-zone direction
+    if prior_trend == "unknown" or zone["start"] < lookback:
+        if after_change > 0.05:
             zone_type = "Accumulation"
+        elif after_change < -0.05:
+            zone_type = "Distribution"
         else:
             zone_type = "Re-Accumulation"
 
-    # Override: if zone is SMALL and tight during a clear uptrend = Re-Accumulation
-    # Check if price after zone is higher than before = markup context
-    after_end = min(zone["end"]+30, len_df-1)
-    before_start_price = df["Close"].iloc[max(0,zone["start"]-30)] if zone["start"] > 0 else df["Close"].iloc[0]
-    zone_mid_price = (zone["high"]+zone["low"])/2
-    if (zone_type == "Accumulation" and
-        zone_range < 0.10 and
-        zone_mid_price > before_start_price * 1.10):
+    # Rule 2: After markdown = Accumulation
+    elif prior_trend == "markdown":
+        zone_type = "Accumulation"
+
+    # Rule 3: After markup — check range and after-behavior
+    elif prior_trend == "markup":
+        if zone_range > 0.08:
+            # Wide range after markup = Distribution TR
+            zone_type = "Distribution"
+        elif after_change < -0.05:
+            # Price drops after = Distribution confirmed
+            zone_type = "Distribution"
+        elif zone_range < 0.08 and vol_ratio < 0.90:
+            # Tight + low volume during markup = Re-Accumulation
+            zone_type = "Re-Accumulation"
+        else:
+            zone_type = "Distribution"
+
+    # Rule 4: Sideways after sideways = Re-Accumulation or Re-Distribution
+    elif prior_trend == "sideways":
+        if after_change > 0.03:
+            zone_type = "Re-Accumulation"
+        elif after_change < -0.03:
+            zone_type = "Re-Distribution"
+        else:
+            zone_type = "Re-Accumulation"
+    else:
         zone_type = "Re-Accumulation"
-    if (zone_type == "Distribution" and
-        zone_range < 0.10 and
-        zone_mid_price < before_start_price * 0.90):
-        zone_type = "Re-Distribution"
 
     zone["type"]        = zone_type
     zone["prior_trend"] = prior_trend
@@ -263,6 +280,39 @@ def detect_Spring(df, sc, ar, zone_end):
             return {"event":"Spring","date":str(date.date()),
                     "price":round(float(row["Low"]),2),
                     "volume":int(row["Volume"]),"bar_index":i}
+    return None
+
+
+
+def detect_COB_in_zone(df, zone, bc):
+    """
+    COB — Change of Behavior (from Wyckoff course):
+    - First sign that supply is overcoming demand inside Distribution TR
+    - A wide spread DOWN bar on heavy volume
+    - Closes near the LOW of the bar
+    - Usually occurs after a failed rally (UT or LPSY)
+    """
+    if not bc: return None
+    s, e = zone["start"], zone["end"]
+    avv = avg_vol(df, 20)
+    avs = avg_spd(df, 20)
+
+    for date, row in df.iloc[s:e].iterrows():
+        i = df.index.get_loc(date)
+        sp = row["High"] - row["Low"]
+        # Wide down bar
+        if row["Close"] >= row["Open"]: continue
+        if avs.iloc[i] > 0 and sp < avs.iloc[i] * 1.1: continue
+        # Heavy volume
+        if avv.iloc[i] > 0 and row["Volume"] < avv.iloc[i] * 1.1: continue
+        # Close near low
+        if close_pos(row) > 0.35: continue
+        # Must be after BC
+        if i <= bc["bar_index"]: continue
+
+        return {"event":"COB","date":str(date.date()),
+                "price":round(float(row["Low"]),2),
+                "volume":int(row["Volume"]),"bar_index":i}
     return None
 
 def detect_SOS(df, ar, zone_end):
@@ -391,6 +441,9 @@ def detect_wyckoff_events(df):
                 ar_d = detect_AR_after_BC(df, bc, e)
                 if ar_d:
                     events.append(ar_d)
+                    # COB — Change of Behavior inside TR
+                    cob = detect_COB_in_zone(df, z, bc)
+                    if cob: events.append(cob)
                     sow = detect_SOW(df, ar_d, e)
                     if sow: events.append(sow)
 
