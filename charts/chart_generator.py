@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 EVENT_COLORS = {
-    "BC":"#e03c3c","PSY":"#ff7043","SOW":"#ef5350",
+    "BC":"#e03c3c","PSY":"#ff7043","SOW":"#ef5350","COB":"#f48fb1",
     "AR":"#4fc3f7","SOS":"#43a047",
     "SC":"#e03c3c","LPS":"#66bb6a","Spring":"#a5d6a7","ST":"#90caf9",
 }
@@ -15,8 +15,8 @@ ZONE_COLORS = {
     "Re-Accumulation": ("#26c6da", 0.13),
     "Re-Distribution": ("#ff7043", 0.13),
 }
-TOP_EVENTS = {"BC","PSY","SOW","AR","SOS"}
-BOT_EVENTS = {"SC","LPS","Spring","ST"}
+TOP_EVENTS = {"BC","PSY","AR","SOS"}
+BOT_EVENTS = {"SC","LPS","Spring","ST","SOW","COB"}
 
 
 def draw_chart(ticker, df, analysis):
